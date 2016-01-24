@@ -1,0 +1,38 @@
+{
+  "name": "@tradle/ws-client",
+  "version": "1.0.0",
+  "description": "tradle websockets client",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tradle/ws-client"
+  },
+  "keywords": [
+    "tradle",
+    "websockets",
+    "client",
+    "messenger"
+  ],
+  "author": "Mark Vayngrib <mark.vayngrib@lablz.com> (http://github.com/mvayngrib)",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/tradle/ws-client/issues"
+  },
+  "homepage": "https://github.com/tradle/ws-client",
+  "dependencies": {
+    "@tradle/constants": "^1.1.7",
+    "@tradle/otr": "^0.2.15",
+    "debug": "^2.2.0",
+    "q": "^1.4.1",
+    "socket.io-client": "^1.4.4",
+    "typeforce": "^1.6.1"
+  },
+  "devDependencies": {
+    "@tradle/utils": "^1.0.0",
+    "@tradle/ws-relay": "^1.0.0",
+    "tape": "^4.4.0"
+  }
+}
