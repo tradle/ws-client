@@ -85,13 +85,13 @@ test('websockets with relay', function (t) {
 
   var togo = 2
 
-  bill.send(rufusRootHash, toBuffer({
+  var send1 = bill.send(rufusRootHash, toBuffer({
     hey: 'rufus'
-  }), rufusInfo).done()
+  }), rufusInfo)
 
-  rufus.send(billRootHash, toBuffer({
+  var send2 = rufus.send(billRootHash, toBuffer({
     hey: 'bill'
-  }), billInfo).done()
+  }), billInfo)
 
   bill.on('message', function (msg) {
     done()
@@ -106,11 +106,15 @@ test('websockets with relay', function (t) {
   function done () {
     if (--togo) return
 
-    Q.all([
-      relay.destroy(),
-      bill.destroy(),
-      rufus.destroy()
-    ]).done(function () {
+    Q.all([send1, send2])
+    .then(function () {
+      return Q.all([
+        relay.destroy(),
+        bill.destroy(),
+        rufus.destroy()
+      ])
+    })
+    .done(function () {
       t.end()
       // Socket.IO takes ~30 seconds to clean up (timeout its connections)
       // no one wants to wait that long for tests to finish

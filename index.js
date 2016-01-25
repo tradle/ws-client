@@ -20,6 +20,7 @@ function Client (opts) {
     url: 'String',
     otrKey: 'DSA',
     // byRootHash: 'Function',
+    instanceTag: '?String',
     autoconnect: '?Boolean', // defaults to true
     rootHash: '?String'
   }, opts)
@@ -35,6 +36,7 @@ function Client (opts) {
   this._sessions = {}
   this._otrKey = opts.otrKey
   this._connected = false
+  this._instanceTag = opts.instanceTag
   if (opts.rootHash) this.setRootHash(opts.rootHash)
 }
 
@@ -98,25 +100,42 @@ Client.prototype.setRootHash = function (rootHash) {
   return this
 }
 
+Client.prototype._debug = function () {
+  var args = Array.prototype.slice.call(arguments)
+  args.unshift(this._rootHash)
+  return debug.apply(null, args)
+}
+
 Client.prototype._onmessage = function (msg, acknowledgeReceipt) {
   acknowledgeReceipt()
 
   try {
     typeforce({
       from: 'String',
-      message: MSG_CONTENT_TYPE
+      message: MSG_CONTENT_TYPE,
+      // seq: '?Number',
+      // ack: '?Number'
     }, msg)
   } catch (err) {
     debug('received invalid message missing "from"')
     return
   }
 
-  if (!this._sessions[msg.from]) {
-    this._createSession(msg.from)
+  var session = this._sessions[msg.from]
+  if (!session) {
+    session = this._sessions[msg.from] = this._createSession(msg.from)
   }
 
-  this._sessions[msg.from].otr.receiveMsg(msg.message)
-  // this.emit('message', msg.message, identityInfo)
+  // if (!isNaN(msg.ack)) {
+  //   var cb = session.deliveryTrackers.del(msg.ack)
+  //   if (cb) cb()
+  // }
+
+  // ack on the next send
+  // if (!isNaN(msg.seq)) session.ack = msg.seq
+
+ // console.log('in', msg.seq, msg.ack)
+  session.otr.receiveMsg(msg.message)
 }
 
 // Client.prototype._handshake = function () {
@@ -225,7 +244,14 @@ Client.prototype.send = function (rootHash, msg, identityInfo) {
     // we just sent the last piece of this message
     // replace the placeholder we pushed
     // yes, this is ugly
-    deliveryTrackers[deliveryTrackers.length - 1] = defer.resolve
+    var seq = session.seq - 1
+    setTimeout(function () {
+      defer.reject(new Error('timed out'))
+    }, 5000)
+    deliveryTrackers[seq] = defer
+    defer.promise.finally(function () {
+      delete deliveryTrackers[seq]
+    })
   })
 
   return defer.promise
@@ -233,17 +259,24 @@ Client.prototype.send = function (rootHash, msg, identityInfo) {
 
 Client.prototype._createSession = function (recipientRootHash) {
   var self = this
-  var deliveryTrackers = []
+  var deliveryTrackers = {}
   var otr = new OTR({
-    priv: this._otrKey
+    priv: this._otrKey,
+    instance_tag: this.instanceTag
   })
 
   var session = this._sessions[recipientRootHash] = {
     otr: otr,
-    deliveryTrackers: deliveryTrackers
+    deliveryTrackers: deliveryTrackers,
+    seq: 0
   }
 
-  otr.ALLOW_V2 = false
+  if (this.instanceTag) {
+    otr.ALLOW_V2 = false
+  } else {
+    otr.ALLOW_V3 = false
+  }
+
   otr.REQUIRE_ENCRYPTION = true
   otr.on('ui', function (msg) {
     var senderInfo = {}
@@ -252,49 +285,37 @@ Client.prototype._createSession = function (recipientRootHash) {
   })
 
   otr.on('io', function (msg, metadata) {
-    deliveryTrackers.push(null) // placeholder
+    var seq = session.seq++
+    self._debug('sending', seq)
     self._socket.emit('message', {
       from: self._rootHash,
       to: recipientRootHash,
       message: msg
-    }, function acknowledgement () {
-      var cb = deliveryTrackers.shift()
-      if (cb) cb()
+    }, function (ack) {
+      var defer = deliveryTrackers[seq]
+      if (defer) {
+        delete deliveryTrackers[seq]
+        self._debug('delivered message')
+        if (ack && ack.error) {
+          defer.reject(new Error(ack.error.message))
+        } else {
+          defer.resolve()
+        }
+      }
     })
   })
 
   otr.on('error', function (err) {
-    debug('otr err', err)
-    self._destroySession(recipientRootHash)
+    self._debug('otr err', err)
+    // self._destroySession(recipientRootHash)
   })
+
+  otr.on('status', function (status) {
+    self._debug('otr status', status)
+  })
+
+  return session
 }
-
-// Client.prototype._sendOTR = function (session, msg, metadata) {
-//   var self = this
-
-//   if (!this._socket) {
-//     session.queued.push(arguments)
-//     this.once('connect', function () {
-//       var queued = session.queued.slice()
-//       session.queued.length = 0
-//       queued.forEach(function (args) {
-//         self._sendOTR.apply(self, args)
-//       })
-//     })
-
-//     return
-//   }
-
-//   session.deliveryTrackers.push(null) // placeholder
-//   this._socket.emit('message', {
-//     from: this._rootHash,
-//     to: session.recipient,
-//     message: msg
-//   }, function acknowledgement () {
-//     var cb = session.deliveryTrackers.shift()
-//     if (cb) cb()
-//   })
-// }
 
 Client.prototype._destroySession = function (rootHash) {
   var self = this
@@ -311,7 +332,7 @@ Client.prototype.destroy = function () {
   var self = this
   if (this._destroyed) return Q.reject(new Error('already destroyed'))
 
-  debug('destroying')
+  this._debug('destroying')
   this._destroyed = true
   return Q.all(Object.keys(this._sessions).map(this._destroySession, this))
     .then(function () {
