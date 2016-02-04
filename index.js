@@ -43,7 +43,7 @@ function Client (opts) {
 util.inherits(Client, EventEmitter)
 module.exports = Client
 
-Client.prototype.connect = function (reconnect) {
+Client.prototype.connect = function () {
   var self = this
 
   if (!this._rootHash) throw new Error('set "rootHash" first')
@@ -52,8 +52,7 @@ Client.prototype.connect = function (reconnect) {
   }
 
   var base = this._url.protocol + '//' + this._url.host
-  this._socket = io.connect(base, { reconnection: reconnect, path: this._url.path })
-  this._socket.emit('subscribe', this._rootHash)
+  this._socket = io(base, { reconnection: false, path: this._url.path })
   this._socket.on('error', function (err) {
     debug('socket experienced error', err)
     self._socket.disconnect()
@@ -65,13 +64,24 @@ Client.prototype.connect = function (reconnect) {
   } else {
     this._socket.on('message', this._onmessage)
     this._socket.on('disconnect', function () {
+      if (self._destroyed) return
+
+      self._debug('disconnected, reconnecting')
       self._connected = false
+      setTimeout(function () {
+        self._socket.connect()
+      }, 50)
     })
 
     this._socket.on('connect', function () {
+      if (self._destroyed) return
+
+      self._debug('connected')
       self._connected = true
+      // make sure to emit 'subscribe'
+      // before we start emitting 'message' on the socket
+      self._socket.emit('subscribe', self._rootHash)
       self.emit('connect')
-      debug('connected')
     })
 
     return this._promiseConnected()
@@ -95,7 +105,7 @@ Client.prototype.isConnected = function () {
 Client.prototype.setRootHash = function (rootHash) {
   typeforce('String', rootHash)
   this._rootHash = rootHash
-  if (!this._socket && this._autoconnect) this.connect(true)
+  if (!this._socket && this._autoconnect) this.connect()
 
   return this
 }
@@ -127,7 +137,7 @@ Client.prototype._onmessage = function (msg, acknowledgeReceipt) {
   }
 
   // if (!isNaN(msg.ack)) {
-  //   var cb = session.deliveryTrackers.del(msg.ack)
+  //   var cb = session.outgoing.del(msg.ack)
   //   if (cb) cb()
   // }
 
@@ -239,7 +249,7 @@ Client.prototype.send = function (rootHash, msg, identityInfo) {
 
   var defer = Q.defer()
   var session = this._sessions[rootHash]
-  var deliveryTrackers = session.deliveryTrackers
+  var outgoing = session.outgoing
   session.otr.sendMsg(msg.toString(MSG_ENCODING), function () {
     // we just sent the last piece of this message
     // replace the placeholder we pushed
@@ -248,9 +258,10 @@ Client.prototype.send = function (rootHash, msg, identityInfo) {
     setTimeout(function () {
       defer.reject(new Error('timed out'))
     }, 5000)
-    deliveryTrackers[seq] = defer
+
+    outgoing[seq] = defer
     defer.promise.finally(function () {
-      delete deliveryTrackers[seq]
+      delete outgoing[seq]
     })
   })
 
@@ -259,16 +270,19 @@ Client.prototype.send = function (rootHash, msg, identityInfo) {
 
 Client.prototype._createSession = function (recipientRootHash) {
   var self = this
-  var deliveryTrackers = {}
+  var outgoing = {}
   var otr = new OTR({
+    debug: debug.enabled,
     priv: this._otrKey,
     instance_tag: this.instanceTag
   })
 
   var session = this._sessions[recipientRootHash] = {
+    recipient: recipientRootHash,
     otr: otr,
-    deliveryTrackers: deliveryTrackers,
-    seq: 0
+    outgoing: outgoing,
+    seq: 0,
+    queue: []
   }
 
   if (this.instanceTag) {
@@ -285,24 +299,12 @@ Client.prototype._createSession = function (recipientRootHash) {
   })
 
   otr.on('io', function (msg, metadata) {
-    var seq = session.seq++
-    self._debug('sending', seq)
-    self._socket.emit('message', {
-      from: self._rootHash,
-      to: recipientRootHash,
-      message: msg
-    }, function (ack) {
-      var defer = deliveryTrackers[seq]
-      if (defer) {
-        delete deliveryTrackers[seq]
-        self._debug('delivered message')
-        if (ack && ack.error) {
-          defer.reject(new Error(ack.error.message))
-        } else {
-          defer.resolve()
-        }
-      }
+    session.queue.push({
+      message: msg,
+      seq: session.seq++
     })
+
+    self._processQueue(session)
   })
 
   otr.on('error', function (err) {
@@ -315,6 +317,47 @@ Client.prototype._createSession = function (recipientRootHash) {
   })
 
   return session
+}
+
+Client.prototype._processQueue = function (session) {
+  var self = this
+  if (!this._connected) {
+    this._debug('waiting for connect')
+    return this.once('connect', this._processQueue.bind(this, session))
+  }
+
+  var queue = session.queue
+  if (!queue.length) return
+
+  var next = queue.shift()
+  this._socket.once('disconnect', resend)
+
+  var outgoing = session.outgoing
+  var seq = next.seq
+  this._debug('sending', seq)
+  this._socket.emit('message', {
+    from: this._rootHash,
+    to: session.recipient,
+    message: next.message
+  }, function (ack) {
+    self._socket.off('disconnect', resend)
+    var defer = outgoing[seq]
+    if (!defer) return
+
+    delete outgoing[seq]
+    self._debug('delivered message')
+    if (ack && ack.error) {
+      defer.reject(new Error(ack.error.message))
+    } else {
+      defer.resolve()
+    }
+  })
+
+  function resend () {
+    self._debug('resending')
+    queue.unshift(next)
+    self._processQueue(session)
+  }
 }
 
 Client.prototype._destroySession = function (rootHash) {

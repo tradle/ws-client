@@ -71,6 +71,10 @@ test('websockets with relay', function (t) {
     rootHash: billRootHash,
   })
 
+  bill.once('connect', function () {
+    bill._socket.ondisconnect()
+  })
+
   var rufusInfo = {
     identity: rufusPub
   }
