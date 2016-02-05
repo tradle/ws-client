@@ -1,6 +1,6 @@
 {
   "name": "@tradle/ws-client",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "tradle websockets client",
   "main": "index.js",
   "scripts": {
