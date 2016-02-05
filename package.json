@@ -25,6 +25,7 @@
   "dependencies": {
     "@tradle/constants": "^1.1.7",
     "@tradle/otr": "^0.2.15",
+    "backoff": "^2.4.1",
     "debug": "^2.2.0",
     "q": "^1.4.1",
     "socket.io-client": "^1.4.4",

@@ -2,6 +2,7 @@
 var EventEmitter = require('events').EventEmitter
 var parseURL = require('url').parse
 var util = require('util')
+var backoff = require('backoff')
 var Q = require('q')
 var debug = require('debug')('websocket-client')
 var typeforce = require('typeforce')
@@ -11,6 +12,7 @@ var OTR = require('@tradle/otr').OTR
 var ROOT_HASH = constants.ROOT_HASH
 var MSG_ENCODING = 'base64'
 var MSG_CONTENT_TYPE = 'String'
+var SESSION_TIMEOUT = 5000
 // var HANDSHAKE_TIMEOUT = 5000
 
 function Client (opts) {
@@ -37,10 +39,12 @@ function Client (opts) {
   this._otrKey = opts.otrKey
   this._connected = false
   this._instanceTag = opts.instanceTag
+  this._backoff = backoff.exponential({ initialDelay: 100 })
   if (opts.rootHash) this.setRootHash(opts.rootHash)
 }
 
 util.inherits(Client, EventEmitter)
+Client.OTR_ERROR = 'OTR error'
 module.exports = Client
 
 Client.prototype.connect = function () {
@@ -58,7 +62,7 @@ Client.prototype.connect = function () {
     self._socket.disconnect()
   })
 
-  // TODO: implement handshake
+  // TODO: implement handshake with relay
   if (false) {
     return this._handshake()
   } else {
@@ -68,9 +72,10 @@ Client.prototype.connect = function () {
 
       self._debug('disconnected, reconnecting')
       self._connected = false
-      setTimeout(function () {
-        self._socket.connect()
-      }, 50)
+      self._closeSessions()
+        .then(function () {
+          return self._reconnect()
+        })
     })
 
     this._socket.on('connect', function () {
@@ -96,8 +101,6 @@ Client.prototype._promiseConnected = function () {
   return defer.promise
 }
 
-
-
 Client.prototype.isConnected = function () {
   return this._connected
 }
@@ -117,17 +120,14 @@ Client.prototype._debug = function () {
 }
 
 Client.prototype._onmessage = function (msg, acknowledgeReceipt) {
-  acknowledgeReceipt()
-
   try {
     typeforce({
       from: 'String',
-      message: MSG_CONTENT_TYPE,
-      // seq: '?Number',
-      // ack: '?Number'
+      message: MSG_CONTENT_TYPE
     }, msg)
   } catch (err) {
-    debug('received invalid message missing "from"')
+    debug('received invalid message')
+    acknowledgeReceipt({ error: { message: 'invalid message' }})
     return
   }
 
@@ -136,16 +136,19 @@ Client.prototype._onmessage = function (msg, acknowledgeReceipt) {
     session = this._sessions[msg.from] = this._createSession(msg.from)
   }
 
-  // if (!isNaN(msg.ack)) {
-  //   var cb = session.outgoing.del(msg.ack)
-  //   if (cb) cb()
-  // }
+  var err
+  var otr = session.otr
+  otr.on('error', onerror)
+  otr.receiveMsg(msg.message)
+  otr.removeListener('error', onerror)
 
-  // ack on the next send
-  // if (!isNaN(msg.seq)) session.ack = msg.seq
+  if (err) acknowledgeReceipt({ error: { message: Client.OTR_ERROR } })
+  else acknowledgeReceipt()
 
- // console.log('in', msg.seq, msg.ack)
-  session.otr.receiveMsg(msg.message)
+  function onerror (e) {
+    err = e
+    otr.removeListener('error', onerror)
+  }
 }
 
 // Client.prototype._handshake = function () {
@@ -234,7 +237,7 @@ Client.prototype._onmessage = function (msg, acknowledgeReceipt) {
 
 Client.prototype.send = function (rootHash, msg, identityInfo) {
   var self = this
-  if (!this._socket) {
+  if (!this._connected) {
     return this.connect()
       .then(function () {
         return self.send(rootHash, msg, identityInfo)
@@ -247,30 +250,48 @@ Client.prototype.send = function (rootHash, msg, identityInfo) {
     this._createSession(rootHash)
   }
 
-  var defer = Q.defer()
+  var attemptsLeft = 3
   var session = this._sessions[rootHash]
-  var outgoing = session.outgoing
-  session.otr.sendMsg(msg.toString(MSG_ENCODING), function () {
-    // we just sent the last piece of this message
-    // replace the placeholder we pushed
-    // yes, this is ugly
-    var seq = session.seq - 1
-    setTimeout(function () {
-      defer.reject(new Error('timed out'))
-    }, 5000)
+  return trySend()
+    .catch(function (err) {
+      if (err.message !== Client.OTR_ERROR || attemptsLeft-- <= 0) {
+        throw err
+      }
 
-    outgoing[seq] = defer
-    defer.promise.finally(function () {
-      delete outgoing[seq]
+      self._debug('experienced OTR error, retrying')
+      // return self._rebootSession(rootHash)
+      //   .then(tryResend)
+      return trySend()
     })
-  })
 
-  return defer.promise
+  function trySend () {
+    var defer = Q.defer()
+    session.otr.sendMsg(msg.toString(MSG_ENCODING), function () {
+      setTimeout(function () {
+        defer.reject(new Error('timed out'))
+      }, 5000)
+
+      // we just sent the last piece of this message
+      // replace the placeholder we pushed
+      //
+      // yes, this is ugly
+      session.currentMsgPieces[session.currentMsgPieces.length - 1].defer = defer
+    })
+
+    return defer.promise
+  }
+}
+
+Client.prototype._rebootSession = function (recipientRootHash) {
+  var self = this
+  return this._destroySession(recipientRootHash)
+    .then(function () {
+      return self._createSession(recipientRootHash)
+    })
 }
 
 Client.prototype._createSession = function (recipientRootHash) {
   var self = this
-  var outgoing = {}
   var otr = new OTR({
     debug: debug.enabled,
     priv: this._otrKey,
@@ -280,9 +301,8 @@ Client.prototype._createSession = function (recipientRootHash) {
   var session = this._sessions[recipientRootHash] = {
     recipient: recipientRootHash,
     otr: otr,
-    outgoing: outgoing,
     seq: 0,
-    queue: []
+    currentMsgPieces: []
   }
 
   if (this.instanceTag) {
@@ -299,22 +319,26 @@ Client.prototype._createSession = function (recipientRootHash) {
   })
 
   otr.on('io', function (msg, metadata) {
-    session.queue.push({
+    session.currentMsgPieces.push({
       message: msg,
       seq: session.seq++
     })
 
-    self._processQueue(session)
+    process.nextTick(function () {
+      self._processQueue(session)
+    })
   })
 
   otr.on('error', function (err) {
     self._debug('otr err', err)
-    // self._destroySession(recipientRootHash)
+    self._rebootSession(recipientRootHash)
   })
 
   otr.on('status', function (status) {
     self._debug('otr status', status)
   })
+
+  otr.sendQueryMsg()
 
   return session
 }
@@ -326,13 +350,14 @@ Client.prototype._processQueue = function (session) {
     return this.once('connect', this._processQueue.bind(this, session))
   }
 
-  var queue = session.queue
-  if (!queue.length) return
+  // clearTimeout(session.timeout)
+  // session.timeout = setTimeout(this._destroySession.bind(this, session.recipient), SESSION_TIMEOUT)
+  var currentMsgPieces = session.currentMsgPieces
+  if (!currentMsgPieces.length) return
 
-  var next = queue.shift()
   this._socket.once('disconnect', resend)
 
-  var outgoing = session.outgoing
+  var next = currentMsgPieces.shift()
   var seq = next.seq
   this._debug('sending', seq)
   this._socket.emit('message', {
@@ -341,10 +366,9 @@ Client.prototype._processQueue = function (session) {
     message: next.message
   }, function (ack) {
     self._socket.off('disconnect', resend)
-    var defer = outgoing[seq]
-    if (!defer) return
+    var defer = next.defer
+    if (!(defer && defer.promise.isPending())) return
 
-    delete outgoing[seq]
     self._debug('delivered message')
     if (ack && ack.error) {
       defer.reject(new Error(ack.error.message))
@@ -355,7 +379,7 @@ Client.prototype._processQueue = function (session) {
 
   function resend () {
     self._debug('resending')
-    queue.unshift(next)
+    currentMsgPieces.unshift(next)
     self._processQueue(session)
   }
 }
@@ -367,6 +391,12 @@ Client.prototype._destroySession = function (rootHash) {
 
   return Q.ninvoke(session.otr, 'endOtr')
     .finally(function () {
+      var s = self._sessions[rootHash]
+      s.currentMsgPieces.forEach(function (item) {
+        var defer = item.defer
+        if (defer) defer.reject(new Error('session destroyed'))
+      })
+
       delete self._sessions[rootHash]
     })
 }
@@ -377,9 +407,29 @@ Client.prototype.destroy = function () {
 
   this._debug('destroying')
   this._destroyed = true
-  return Q.all(Object.keys(this._sessions).map(this._destroySession, this))
+  return this._closeSessions()
     .then(function () {
       self._socket.disconnect()
       delete self._sessions
     })
+}
+
+Client.prototype._closeSessions = function () {
+  return Q.all(Object.keys(this._sessions).map(this._destroySession, this))
+}
+
+Client.prototype._reconnect = function () {
+  var self = this
+  this._backoff.reset()
+  this._backoff.removeAllListeners()
+  this._backoff.backoff()
+  this._backoff.on('ready', function () {
+    self._debug('backing off and reconnecting')
+    self._backoff.backoff()
+    self._socket.connect()
+  })
+
+  this._socket.once('connect', function () {
+    self._backoff.reset()
+  })
 }

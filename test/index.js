@@ -69,8 +69,23 @@ test('websockets with relay', function (t) {
     url: relayURL,
     otrKey: getDSAKey(billPriv),
     rootHash: billRootHash,
+    autoconnect: false
   })
 
+  var onmsg = bill._onmessage
+  // in this test,
+  // 4 comes at the last piece of a message
+  var errored = 4
+  bill._onmessage = function (msg, acknowledge) {
+    if (errored-- === 0) {
+      errored = true
+      return acknowledge({ error: { message: WebSocketClient.OTR_ERROR } })
+    }
+
+    return onmsg.apply(bill, arguments)
+  }
+
+  bill.connect()
   bill.once('connect', function () {
     bill._socket.ondisconnect()
   })
