@@ -58,17 +58,18 @@ test('websockets with relay', function (t) {
     path: relayPath
   })
 
+  var rufusDSA = getDSAKey(rufusPriv)
+  var billDSA = getDSAKey(billPriv)
+
   var relayURL = 'http://127.0.0.1:' + port + path.join('/', relayPath)
   var rufus = new WebSocketClient({
     url: relayURL,
-    otrKey: getDSAKey(rufusPriv),
-    rootHash: rufusRootHash,
+    otrKey: rufusDSA
   })
 
   var bill = new WebSocketClient({
     url: relayURL,
-    otrKey: getDSAKey(billPriv),
-    rootHash: billRootHash,
+    otrKey: billDSA,
     autoconnect: false
   })
 

@@ -23,24 +23,21 @@ function Client (opts) {
     otrKey: 'DSA',
     // byRootHash: 'Function',
     instanceTag: '?String',
-    autoconnect: '?Boolean', // defaults to true
-    rootHash: '?String'
+    autoconnect: '?Boolean' // defaults to true
   }, opts)
 
   EventEmitter.call(this)
 
   this._url = parseURL(opts.url)
   this._autoconnect = opts.autoconnect !== false
-  // this._myIdentifier = {}
-  // this._myIdentifier[ROOT_HASH] = this._rootHash
-  // this._lookup = opts.byRootHash
   this._onmessage = this._onmessage.bind(this)
   this._sessions = {}
   this._otrKey = opts.otrKey
+  this._fingerprint = opts.otrKey.fingerprint()
   this._connected = false
   this._instanceTag = opts.instanceTag
   this._backoff = backoff.exponential({ initialDelay: 100 })
-  if (opts.rootHash) this.setRootHash(opts.rootHash)
+  if (this._autoconnect) this.connect()
 }
 
 util.inherits(Client, EventEmitter)
@@ -50,7 +47,6 @@ module.exports = Client
 Client.prototype.connect = function () {
   var self = this
 
-  if (!this._rootHash) throw new Error('set "rootHash" first')
   if (this._socket) {
     return this._promiseConnected()
   }
@@ -85,7 +81,7 @@ Client.prototype.connect = function () {
       self._connected = true
       // make sure to emit 'subscribe'
       // before we start emitting 'message' on the socket
-      self._socket.emit('subscribe', self._rootHash)
+      self._socket.emit('subscribe', self._fingerprint)
       self.emit('connect')
     })
 
@@ -105,17 +101,9 @@ Client.prototype.isConnected = function () {
   return this._connected
 }
 
-Client.prototype.setRootHash = function (rootHash) {
-  typeforce('String', rootHash)
-  this._rootHash = rootHash
-  if (!this._socket && this._autoconnect) this.connect()
-
-  return this
-}
-
 Client.prototype._debug = function () {
   var args = Array.prototype.slice.call(arguments)
-  args.unshift(this._rootHash)
+  args.unshift(this._fingerprint)
   return debug.apply(null, args)
 }
 
@@ -237,23 +225,27 @@ Client.prototype._onmessage = function (msg, acknowledgeReceipt) {
 //   this._thems[rootHash] = url
 // }
 
-Client.prototype.send = function (rootHash, msg, identityInfo) {
+Client.prototype.send = function (toRootHash, msg, identityInfo) {
+  var toFingerprint = identityInfo.identity.pubkeys.filter(function (k) {
+    return k.type === 'dsa'
+  })[0].fingerprint
+
   var self = this
   if (!this._connected) {
     return this.connect()
       .then(function () {
-        return self.send(rootHash, msg, identityInfo)
+        return self.send(toFingerprint, msg, identityInfo)
       })
   }
 
   if (Buffer.isBuffer(msg)) msg = msg.toString(MSG_ENCODING)
 
-  if (!this._sessions[rootHash]) {
-    this._createSession(rootHash)
+  if (!this._sessions[toFingerprint]) {
+    this._createSession(toFingerprint)
   }
 
   var attemptsLeft = 3
-  var session = this._sessions[rootHash]
+  var session = this._sessions[toFingerprint]
   return trySend()
     .catch(function (err) {
       if (err.message !== Client.OTR_ERROR || attemptsLeft-- <= 0) {
@@ -261,8 +253,6 @@ Client.prototype.send = function (rootHash, msg, identityInfo) {
       }
 
       self._debug('experienced OTR error, retrying')
-      // return self._rebootSession(rootHash)
-      //   .then(tryResend)
       return trySend()
     })
 
@@ -284,15 +274,15 @@ Client.prototype.send = function (rootHash, msg, identityInfo) {
   }
 }
 
-Client.prototype._rebootSession = function (theirRootHash) {
+Client.prototype._rebootSession = function (theirFingerprint) {
   var self = this
-  return this._destroySession(theirRootHash)
+  return this._destroySession(theirFingerprint)
     .then(function () {
-      return self._createSession(theirRootHash)
+      return self._createSession(theirFingerprint)
     })
 }
 
-Client.prototype._createSession = function (theirRootHash) {
+Client.prototype._createSession = function (announcedFingerprint) {
   var self = this
   var otr = new OTR({
     debug: debug.enabled,
@@ -300,10 +290,8 @@ Client.prototype._createSession = function (theirRootHash) {
     instance_tag: this.instanceTag
   })
 
-  var session = this._sessions[theirRootHash] = {
-    them: {
-      [ROOT_HASH]: theirRootHash
-    },
+  var session = this._sessions[announcedFingerprint] = {
+    them: announcedFingerprint,
     otr: otr,
     currentMsgPieces: []
   }
@@ -316,13 +304,7 @@ Client.prototype._createSession = function (theirRootHash) {
 
   otr.REQUIRE_ENCRYPTION = true
   otr.on('ui', function (msg) {
-    var them = {
-      // fingerprint we know for sure
-      // their ROOT_HASH is just their claim
-      fingerprint: session.them.fingerprint
-    }
-
-    self.emit('message', new Buffer(msg, MSG_ENCODING), them)
+    self.emit('message', new Buffer(msg, MSG_ENCODING), { fingerprint: session.them })
   })
 
   otr.on('io', function (msg, metadata) {
@@ -337,19 +319,25 @@ Client.prototype._createSession = function (theirRootHash) {
 
   otr.on('error', function (err) {
     self._debug('otr err', err)
-    self._rebootSession(theirRootHash)
+    self._rebootSession(announcedFingerprint)
   })
 
   otr.on('status', function (status) {
     self._debug('otr status', status)
     if (status !== OTR.CONST.STATUS_AKE_SUCCESS) return
 
-    self._debug('AKE successful. Their OTR pubKey fingerprint: ' + otr.their_priv_pk.fingerprint())
-    session.them.fingerprint = otr.their_priv_pk.fingerprint()
-    // self.pubKey = otr.their_priv_pk
-    // self.fingerprint = self.pubKey.fingerprint()
-    // self._resolved = true
-    // self.emit('resolved', addr, self.pubKey)
+    var theirActualFingerprint = otr.their_priv_pk.fingerprint()
+    if (session.them !== theirActualFingerprint) {
+      self.emit('fraud', {
+        actualFingerprint: theirActualFingerprint,
+        announcedFingerprint: announcedFingerprint
+      })
+
+      self._destroySession(announcedFingerprint)
+      return
+    }
+
+    self._debug('AKE successful, their fingerprint: ' + session.them)
   })
 
   otr.sendQueryMsg()
@@ -373,8 +361,8 @@ Client.prototype._processQueue = function (session) {
 
   var next = currentMsgPieces.shift()
   this._socket.emit('message', {
-    from: this._rootHash,
-    to: session.them[ROOT_HASH],
+    from: this._fingerprint,
+    to: session.them,
     message: next.message
   }, function (ack) {
     self._socket.off('disconnect', resend)
@@ -396,20 +384,20 @@ Client.prototype._processQueue = function (session) {
   }
 }
 
-Client.prototype._destroySession = function (rootHash) {
+Client.prototype._destroySession = function (fingerprint) {
   var self = this
-  var session = this._sessions[rootHash]
+  var session = this._sessions[fingerprint]
   if (!session) return Q()
 
   return Q.ninvoke(session.otr, 'endOtr')
     .finally(function () {
-      var s = self._sessions[rootHash]
+      var s = self._sessions[fingerprint]
       s.currentMsgPieces.forEach(function (item) {
         var defer = item.defer
         if (defer) defer.reject(new Error('session destroyed'))
       })
 
-      delete self._sessions[rootHash]
+      delete self._sessions[fingerprint]
     })
 }
 
