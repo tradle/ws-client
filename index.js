@@ -136,6 +136,8 @@ Client.prototype._onmessage = function (msg, acknowledgeReceipt) {
     session = this._sessions[msg.from] = this._createSession(msg.from)
   }
 
+  this._debug('msg from ' + msg.from)
+
   var err
   var otr = session.otr
   otr.on('error', onerror)
@@ -229,10 +231,10 @@ Client.prototype._onmessage = function (msg, acknowledgeReceipt) {
 // }
 
 // Client.prototype.addEndpoint =
-// Client.prototype.addRecipient = function (rootHash, url) {
+// Client.prototype.addthem = function (rootHash, url) {
 //   typeforce('String', rootHash)
 //   typeforce('String', url)
-//   this._recipients[rootHash] = url
+//   this._thems[rootHash] = url
 // }
 
 Client.prototype.send = function (rootHash, msg, identityInfo) {
@@ -282,15 +284,15 @@ Client.prototype.send = function (rootHash, msg, identityInfo) {
   }
 }
 
-Client.prototype._rebootSession = function (recipientRootHash) {
+Client.prototype._rebootSession = function (theirRootHash) {
   var self = this
-  return this._destroySession(recipientRootHash)
+  return this._destroySession(theirRootHash)
     .then(function () {
-      return self._createSession(recipientRootHash)
+      return self._createSession(theirRootHash)
     })
 }
 
-Client.prototype._createSession = function (recipientRootHash) {
+Client.prototype._createSession = function (theirRootHash) {
   var self = this
   var otr = new OTR({
     debug: debug.enabled,
@@ -298,10 +300,11 @@ Client.prototype._createSession = function (recipientRootHash) {
     instance_tag: this.instanceTag
   })
 
-  var session = this._sessions[recipientRootHash] = {
-    recipient: recipientRootHash,
+  var session = this._sessions[theirRootHash] = {
+    them: {
+      [ROOT_HASH]: theirRootHash
+    },
     otr: otr,
-    seq: 0,
     currentMsgPieces: []
   }
 
@@ -313,15 +316,18 @@ Client.prototype._createSession = function (recipientRootHash) {
 
   otr.REQUIRE_ENCRYPTION = true
   otr.on('ui', function (msg) {
-    var senderInfo = {}
-    senderInfo[ROOT_HASH] = recipientRootHash
-    self.emit('message', new Buffer(msg, MSG_ENCODING), senderInfo)
+    var them = {
+      // fingerprint we know for sure
+      // their ROOT_HASH is just their claim
+      fingerprint: session.them.fingerprint
+    }
+
+    self.emit('message', new Buffer(msg, MSG_ENCODING), them)
   })
 
   otr.on('io', function (msg, metadata) {
     session.currentMsgPieces.push({
-      message: msg,
-      seq: session.seq++
+      message: msg
     })
 
     process.nextTick(function () {
@@ -331,11 +337,19 @@ Client.prototype._createSession = function (recipientRootHash) {
 
   otr.on('error', function (err) {
     self._debug('otr err', err)
-    self._rebootSession(recipientRootHash)
+    self._rebootSession(theirRootHash)
   })
 
   otr.on('status', function (status) {
     self._debug('otr status', status)
+    if (status !== OTR.CONST.STATUS_AKE_SUCCESS) return
+
+    self._debug('AKE successful. Their OTR pubKey fingerprint: ' + otr.their_priv_pk.fingerprint())
+    session.them.fingerprint = otr.their_priv_pk.fingerprint()
+    // self.pubKey = otr.their_priv_pk
+    // self.fingerprint = self.pubKey.fingerprint()
+    // self._resolved = true
+    // self.emit('resolved', addr, self.pubKey)
   })
 
   otr.sendQueryMsg()
@@ -358,11 +372,9 @@ Client.prototype._processQueue = function (session) {
   this._socket.once('disconnect', resend)
 
   var next = currentMsgPieces.shift()
-  var seq = next.seq
-  this._debug('sending', seq)
   this._socket.emit('message', {
     from: this._rootHash,
-    to: session.recipient,
+    to: session.them[ROOT_HASH],
     message: next.message
   }, function (ack) {
     self._socket.off('disconnect', resend)
