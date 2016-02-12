@@ -27,6 +27,7 @@ function Client (opts) {
   }, opts)
 
   EventEmitter.call(this)
+  this.setMaxListeners(0)
 
   this._url = parseURL(opts.url)
   this._autoconnect = opts.autoconnect !== false
