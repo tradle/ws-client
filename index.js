@@ -49,7 +49,7 @@ Client.prototype.connect = function () {
   var self = this
 
   if (this._socket) {
-    this._socket.connect()
+    this._reconnect()
     return this._promiseConnected()
   }
 
