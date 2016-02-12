@@ -48,6 +48,7 @@ Client.prototype.connect = function () {
   var self = this
 
   if (this._socket) {
+    this._socket.connect()
     return this._promiseConnected()
   }
 
@@ -226,16 +227,26 @@ Client.prototype._onmessage = function (msg, acknowledgeReceipt) {
 // }
 
 Client.prototype.send = function (toRootHash, msg, identityInfo) {
+  var self = this
+
   var toFingerprint = identityInfo.identity.pubkeys.filter(function (k) {
     return k.type === 'dsa'
   })[0].fingerprint
 
-  var self = this
+  var timeoutPromise = Q.Promise(function (resolve, reject) {
+    setTimeout(function () {
+      reject(new Error('timed out'))
+    }, 10000)
+  })
+
   if (!this._connected) {
-    return this.connect()
+    return Q.race([
+      this.connect()
       .then(function () {
         return self.send(toFingerprint, msg, identityInfo)
-      })
+      }),
+      timeoutPromise
+    ])
   }
 
   if (Buffer.isBuffer(msg)) msg = msg.toString(MSG_ENCODING)
@@ -246,7 +257,7 @@ Client.prototype.send = function (toRootHash, msg, identityInfo) {
 
   var attemptsLeft = 3
   var session = this._sessions[toFingerprint]
-  return trySend()
+  var tryAFew = trySend()
     .catch(function (err) {
       if (err.message !== Client.OTR_ERROR || attemptsLeft-- <= 0) {
         throw err
@@ -255,6 +266,12 @@ Client.prototype.send = function (toRootHash, msg, identityInfo) {
       self._debug('experienced OTR error, retrying')
       return trySend()
     })
+
+  // TODO: deduplicate with above Q.race
+  return Q.race([
+    tryAFew,
+    timeoutPromise
+  ])
 
   function trySend () {
     var defer = Q.defer()
