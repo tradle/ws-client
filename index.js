@@ -13,6 +13,9 @@ var ROOT_HASH = constants.ROOT_HASH
 var MSG_ENCODING = 'base64'
 var MSG_CONTENT_TYPE = 'String'
 var SESSION_TIMEOUT = 5000
+var SEND_ATTEMPT_TIMEOUT = 5000
+var SEND_TIMEOUT = 10000
+
 // var HANDSHAKE_TIMEOUT = 5000
 
 function Client (opts) {
@@ -235,9 +238,14 @@ Client.prototype.send = function (toRootHash, msg, identityInfo) {
   })[0].fingerprint
 
   var timeoutPromise = Q.Promise(function (resolve, reject) {
-    setTimeout(function () {
-      reject(new Error('timed out'))
-    }, 10000)
+    var timeout = setTimeout(function () {
+      if (timeoutPromise.inspect().state === 'pending') {
+        self._debug('send timed out')
+        reject(new Error('timed out'))
+      }
+    }, SEND_TIMEOUT)
+
+    if (timeout.unref) timeout.unref()
   })
 
   if (!this._connected) {
@@ -277,9 +285,12 @@ Client.prototype.send = function (toRootHash, msg, identityInfo) {
   function trySend () {
     var defer = Q.defer()
     session.otr.sendMsg(msg.toString(MSG_ENCODING), function () {
-      setTimeout(function () {
+      var timeout = setTimeout(function () {
+        self._debug('send attempt timed out')
         defer.reject(new Error('timed out'))
-      }, 5000)
+      }, SEND_ATTEMPT_TIMEOUT)
+
+      if (timeout.unref) timeout.unref()
 
       // we just sent the last piece of this message
       // replace the placeholder we pushed
