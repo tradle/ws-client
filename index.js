@@ -240,6 +240,7 @@ Client.prototype.send = function (toRootHash, msg, identityInfo) {
   var timeoutPromise = Q.Promise(function (resolve, reject) {
     var timeout = setTimeout(function () {
       if (timeoutPromise.inspect().state === 'pending') {
+        attemptsLeft = 0
         self._debug('send timed out')
         reject(new Error('timed out'))
       }
